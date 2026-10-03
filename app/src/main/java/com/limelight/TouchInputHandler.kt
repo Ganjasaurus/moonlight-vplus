@@ -274,8 +274,18 @@ class TouchInputHandler(private val game: Game) {
                 )
                 if (!compatibilityCancelled) updateMousePosition(view, event)
 
-                val buttonState = if (compatibilityCancelled) 0 else event.buttonState
-                val changedButtons = buttonState xor lastButtonState
+                var buttonState = if (compatibilityCancelled) 0 else event.buttonState
+var changedButtons = buttonState xor lastButtonState
+
+if (!compatibilityCancelled && eventSource == 12290) {
+    buttonState = when (event.actionMasked) {
+        MotionEvent.ACTION_DOWN -> buttonState or MotionEvent.BUTTON_PRIMARY
+        MotionEvent.ACTION_UP -> buttonState and MotionEvent.BUTTON_PRIMARY.inv()
+        else -> buttonState or (lastButtonState and MotionEvent.BUTTON_PRIMARY)
+    }
+
+    changedButtons = buttonState xor lastButtonState
+}
 
                 if (changedButtons and MotionEvent.BUTTON_PRIMARY != 0) {
                     if (buttonState and MotionEvent.BUTTON_PRIMARY != 0) {
