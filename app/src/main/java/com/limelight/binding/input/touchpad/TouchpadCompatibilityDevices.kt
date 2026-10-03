@@ -34,7 +34,7 @@ object TouchpadCompatibilityDevices {
     }
 
     private fun isPointer(device: InputDevice): Boolean =
-        !device.isVirtual && !device.supportsSource(InputDevice.SOURCE_TOUCHSCREEN) &&
+        !device.supportsSource(InputDevice.SOURCE_TOUCHSCREEN) &&
             !device.supportsSource(InputDevice.SOURCE_GAMEPAD) &&
             !device.supportsSource(InputDevice.SOURCE_JOYSTICK) &&
             (device.supportsSource(InputDevice.SOURCE_MOUSE) ||
