@@ -13,14 +13,18 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import androidx.preference.PreferenceManager
 import com.limelight.binding.audio.MicrophoneButtonPreferences
+import com.limelight.binding.input.virtual_controller.OscSettingsButtonStore
+import com.limelight.binding.input.virtual_controller.VirtualControllerConfigurationLoader
 import com.limelight.ui.FloatBallPreferences
 import com.limelight.binding.input.advance_setting.config.PageConfigController
 import com.limelight.binding.input.advance_setting.sqlite.SuperConfigDatabaseHelper
 import com.limelight.binding.input.advance_setting.DirectConfigTransfer
 import com.limelight.computers.ComputerDatabaseManager
 import com.limelight.preferences.BackgroundSource
+import com.limelight.preferences.CustomResolutionsStore
 import com.limelight.preferences.PreferenceConfiguration
 import com.limelight.preferences.TouchPointerPresetPreferences
+import com.limelight.preferences.TouchpadInputPreferences
 import com.limelight.nvstream.http.ComputerDetails
 import org.json.JSONArray
 import org.json.JSONException
@@ -173,6 +177,8 @@ class ConfigurationSyncManager(private val context: Context) {
 
     @Throws(JSONException::class)
     fun exportSyncPackage(): String {
+        // Materialize implicit defaults so restoring a fresh-install backup replaces a later list too.
+        CustomResolutionsStore.load(context)
         val sections = JSONObject()
             .put(
                 SECTION_DEFAULT_PREFERENCES,
@@ -241,12 +247,47 @@ class ConfigurationSyncManager(private val context: Context) {
                 )
             )
             .put(
+                SECTION_OSC_SETTINGS_BUTTON,
+                JSONObject().put(
+                    KEY_VALUES,
+                    encodePreferences(
+                        SECTION_OSC_SETTINGS_BUTTON,
+                        context.getSharedPreferences(OscSettingsButtonStore.PREFERENCES_NAME, Context.MODE_PRIVATE),
+                        OscSettingsButtonStore.PORTABLE_PREFERENCE_KEYS
+                    )
+                )
+            )
+            .put(
+                SECTION_OSC_LAYOUT_PROFILES,
+                JSONObject().put(
+                    KEY_VALUES,
+                    encodePreferences(
+                        SECTION_OSC_LAYOUT_PROFILES,
+                        context.getSharedPreferences(
+                            VirtualControllerConfigurationLoader.OSC_PREFERENCE,
+                            Context.MODE_PRIVATE
+                        ),
+                        null
+                    )
+                )
+            )
+            .put(
                 SECTION_TOUCH_POINTER_PRESETS,
                 JSONObject().put(
                     KEY_VALUES,
                     encodeTouchPointerPresetPreferences()
                 )
             )
+            .put(SECTION_TOUCHPAD_INPUT, JSONObject().put(KEY_VALUES, encodePreferences(
+                SECTION_TOUCHPAD_INPUT,
+                context.getSharedPreferences(TouchpadInputPreferences.FILE_NAME, Context.MODE_PRIVATE),
+                TouchpadInputPreferences.PORTABLE_KEYS
+            )))
+            .put(SECTION_TOUCHPAD_PRESETS, JSONObject().put(KEY_VALUES, encodePreferences(
+                SECTION_TOUCHPAD_PRESETS,
+                context.getSharedPreferences(TouchpadInputPreferences.PRESETS_FILE_NAME, Context.MODE_PRIVATE),
+                TOUCH_POINTER_PRESET_PREF_KEYS
+            )))
             .put(SECTION_CROWN_PROFILES, exportCrownProfiles())
             .put(SECTION_PAIRING, exportPairingState())
 
@@ -297,6 +338,18 @@ class ConfigurationSyncManager(private val context: Context) {
                 ) + countValues(
                     valuesFromSection(sections.optJSONObject(SECTION_TOUCH_POINTER_PRESETS)),
                     TOUCH_POINTER_PRESET_PREF_KEYS
+                ) + countValues(
+                    valuesFromSection(sections.optJSONObject(SECTION_TOUCHPAD_INPUT)),
+                    TouchpadInputPreferences.PORTABLE_KEYS
+                ) + countValues(
+                    valuesFromSection(sections.optJSONObject(SECTION_TOUCHPAD_PRESETS)),
+                    TOUCH_POINTER_PRESET_PREF_KEYS
+                ) + countValues(
+                    valuesFromSection(sections.optJSONObject(SECTION_OSC_SETTINGS_BUTTON)),
+                    OscSettingsButtonStore.PORTABLE_PREFERENCE_KEYS
+                ) + countValues(
+                    valuesFromSection(sections.optJSONObject(SECTION_OSC_LAYOUT_PROFILES)),
+                    null
                 ),
             appLastSettingsCount = countValues(
                 valuesFromSection(sections.optJSONObject(SECTION_APP_LAST_SETTINGS)),
@@ -345,7 +398,20 @@ class ConfigurationSyncManager(private val context: Context) {
                     Context.MODE_PRIVATE
                 ),
                 valuesFromSection(sections.optJSONObject(SECTION_TOUCH_POINTER_PRESETS)),
-                TOUCH_POINTER_PRESET_PREF_KEYS
+                TOUCH_POINTER_PRESET_PREF_KEYS,
+                acceptedTypes = ::presetPreferenceTypes
+            ) + applyPreferences(
+                SECTION_TOUCHPAD_INPUT,
+                context.getSharedPreferences(TouchpadInputPreferences.FILE_NAME, Context.MODE_PRIVATE),
+                valuesFromSection(sections.optJSONObject(SECTION_TOUCHPAD_INPUT)),
+                TouchpadInputPreferences.PORTABLE_KEYS,
+                acceptedTypes = { setOf(TYPE_INT, TYPE_DELETED) }
+            ) + applyPreferences(
+                SECTION_TOUCHPAD_PRESETS,
+                context.getSharedPreferences(TouchpadInputPreferences.PRESETS_FILE_NAME, Context.MODE_PRIVATE),
+                valuesFromSection(sections.optJSONObject(SECTION_TOUCHPAD_PRESETS)),
+                TOUCH_POINTER_PRESET_PREF_KEYS,
+                acceptedTypes = ::presetPreferenceTypes
             )
         val appLastSettingsImported = applyPreferences(
             SECTION_APP_LAST_SETTINGS,
@@ -377,16 +443,47 @@ class ConfigurationSyncManager(private val context: Context) {
             valuesFromSection(sections.optJSONObject(SECTION_HIDDEN_APPS)),
             null
         )
+        val oscSettingsButtonImported = applyPreferences(
+            SECTION_OSC_SETTINGS_BUTTON,
+            context.getSharedPreferences(OscSettingsButtonStore.PREFERENCES_NAME, Context.MODE_PRIVATE),
+            valuesFromSection(sections.optJSONObject(SECTION_OSC_SETTINGS_BUTTON)),
+            OscSettingsButtonStore.PORTABLE_PREFERENCE_KEYS,
+            acceptedTypes = { key ->
+                when (key) {
+                    OscSettingsButtonStore.DRAG_ENABLED_KEY -> setOf(TYPE_BOOLEAN, TYPE_DELETED)
+                    OscSettingsButtonStore.SIZE_SCALE_KEY -> setOf(TYPE_FLOAT, TYPE_DELETED)
+                    else -> emptySet()
+                }
+            }
+        )
+        val oscLayoutProfilesImported = applyPreferences(
+            SECTION_OSC_LAYOUT_PROFILES,
+            context.getSharedPreferences(
+                VirtualControllerConfigurationLoader.OSC_PREFERENCE,
+                Context.MODE_PRIVATE
+            ),
+            valuesFromSection(sections.optJSONObject(SECTION_OSC_LAYOUT_PROFILES)),
+            null,
+            acceptedTypes = { _ -> setOf(TYPE_STRING, TYPE_DELETED) }
+        )
 
         val crownResult = importCrownProfiles(sections.optJSONArray(SECTION_CROWN_PROFILES))
         val pairingResult = importPairingState(sections.optJSONObject(SECTION_PAIRING))
 
+        // Restoring an old backup can reintroduce legacy values after this device's
+        // initial migration. Normalize before refreshed preference views read them.
         if (defaultPreferencesImported > 0) {
+            PreferenceConfiguration.migrateDisplaySelections(
+                PreferenceManager.getDefaultSharedPreferences(context)
+            )
+        }
+        CustomResolutionsStore.migrateLegacyLowResolutionPresets(context)
+        if (defaultPreferencesImported > 0 || oscSettingsButtonImported > 0 || oscLayoutProfilesImported > 0) {
             context.sendBroadcast(Intent(BackgroundSource.ACTION_REFRESH))
         }
 
         return ImportResult(
-            defaultPreferencesImported = defaultPreferencesImported,
+            defaultPreferencesImported = defaultPreferencesImported + oscSettingsButtonImported + oscLayoutProfilesImported,
             appLastSettingsImported = appLastSettingsImported,
             customResolutionsImported = customResolutionsImported,
             sceneConfigsImported = sceneConfigsImported,
@@ -1234,88 +1331,6 @@ class ConfigurationSyncManager(private val context: Context) {
         )
     }
 
-    private fun normalizedSectionsForHash(sections: JSONObject): JSONObject {
-        return JSONObject()
-            .put(
-                SECTION_DEFAULT_PREFERENCES,
-                JSONObject().put(
-                    KEY_VALUES,
-                    mergeEncodedValues(
-                        valuesFromSection(sections.optJSONObject(SECTION_DEFAULT_PREFERENCES)),
-                        null,
-                        PORTABLE_DEFAULT_PREF_KEYS
-                    )
-                )
-            )
-            .put(
-                SECTION_APP_LAST_SETTINGS,
-                JSONObject().put(
-                    KEY_VALUES,
-                    mergeEncodedValues(
-                        valuesFromSection(sections.optJSONObject(SECTION_APP_LAST_SETTINGS)),
-                        null,
-                        null
-                    )
-                )
-            )
-            .put(
-                SECTION_CUSTOM_RESOLUTIONS,
-                JSONObject().put(
-                    KEY_VALUES,
-                    mergeEncodedValues(
-                        valuesFromSection(sections.optJSONObject(SECTION_CUSTOM_RESOLUTIONS)),
-                        null,
-                        null
-                    )
-                )
-            )
-            .put(
-                SECTION_SCENE_CONFIGS,
-                JSONObject().put(
-                    KEY_VALUES,
-                    mergeEncodedValues(
-                        valuesFromSection(sections.optJSONObject(SECTION_SCENE_CONFIGS)),
-                        null,
-                        null
-                    )
-                )
-            )
-            .put(
-                SECTION_APP_VIEW_PREFERENCES,
-                JSONObject().put(
-                    KEY_VALUES,
-                    mergeEncodedValues(
-                        valuesFromSection(sections.optJSONObject(SECTION_APP_VIEW_PREFERENCES)),
-                        null,
-                        APP_VIEW_PREF_KEYS
-                    )
-                )
-            )
-            .put(
-                SECTION_HIDDEN_APPS,
-                JSONObject().put(
-                    KEY_VALUES,
-                    mergeEncodedValues(
-                        valuesFromSection(sections.optJSONObject(SECTION_HIDDEN_APPS)),
-                        null,
-                        null
-                    )
-                )
-            )
-            .put(
-                SECTION_TOUCH_POINTER_PRESETS,
-                mergedTouchPointerPresetSectionCore(
-                    sections.optJSONObject(SECTION_TOUCH_POINTER_PRESETS),
-                    null,
-                    "hash"
-                )
-            )
-            .put(
-                SECTION_CROWN_PROFILES,
-                mergeCrownProfiles(sections.optJSONArray(SECTION_CROWN_PROFILES), null)
-            )
-    }
-
     private fun countValues(encodedValues: JSONObject?, allowedKeys: Set<String>?): Int {
         if (encodedValues == null) return 0
 
@@ -1342,79 +1357,6 @@ class ConfigurationSyncManager(private val context: Context) {
                 pairingSection.optString(KEY_PAIRING_CLIENT_PRIVATE_KEY).isNotBlank()
     }
 
-    private fun mergeEncodedValues(
-        externalValues: JSONObject?,
-        localValues: JSONObject?,
-        allowedKeys: Set<String>?
-    ): JSONObject {
-        val merged = JSONObject()
-        val keys = TreeSet<String>()
-        externalValues?.keys()?.forEach { keys.add(it) }
-        localValues?.keys()?.forEach { keys.add(it) }
-
-        for (key in keys) {
-            if (allowedKeys != null && key !in allowedKeys) continue
-
-            val externalValue = externalValues?.optJSONObject(key)
-            val localValue = localValues?.optJSONObject(key)
-            val mergedValue = mergeTypedValue(externalValue, localValue) ?: continue
-            merged.put(key, mergedValue)
-        }
-
-        return merged
-    }
-
-    private fun mergeTypedValue(externalValue: JSONObject?, localValue: JSONObject?): JSONObject? {
-        if (externalValue == null) return localValue
-        if (localValue == null) return externalValue
-
-        val externalType = externalValue.optString(KEY_TYPE)
-        val localType = localValue.optString(KEY_TYPE)
-        if (externalType == TYPE_STRING_SET && localType == TYPE_STRING_SET) {
-            val merged = typedValue(
-                    TYPE_STRING_SET,
-                    mergeStringSetValues(
-                            externalValue.optJSONArray(KEY_VALUE),
-                            localValue.optJSONArray(KEY_VALUE)
-                    )
-            )
-            val winner = chooseNewerEncodedValue(externalValue, localValue)
-            return merged
-                    .put(KEY_UPDATED_AT, maxOf(updatedAt(externalValue), updatedAt(localValue)))
-                    .put(KEY_UPDATED_BY, winner.optString(KEY_UPDATED_BY, deviceId()))
-        }
-
-        return chooseNewerEncodedValue(externalValue, localValue)
-    }
-
-    private fun mergeStringSetValues(externalValues: JSONArray?, localValues: JSONArray?): JSONArray {
-        val merged = TreeSet<String>()
-        if (externalValues != null) {
-            for (i in 0 until externalValues.length()) {
-                merged.add(externalValues.optString(i))
-            }
-        }
-        if (localValues != null) {
-            for (i in 0 until localValues.length()) {
-                merged.add(localValues.optString(i))
-            }
-        }
-        return JSONArray(merged)
-    }
-
-    private fun chooseNewerEncodedValue(externalValue: JSONObject, localValue: JSONObject): JSONObject {
-        val externalUpdatedAt = updatedAt(externalValue)
-        val localUpdatedAt = updatedAt(localValue)
-        return when {
-            externalUpdatedAt > localUpdatedAt -> externalValue
-            localUpdatedAt > externalUpdatedAt -> localValue
-            externalValue.optString(KEY_UPDATED_BY) > localValue.optString(KEY_UPDATED_BY) -> externalValue
-            externalValue.optString(KEY_UPDATED_BY) < localValue.optString(KEY_UPDATED_BY) -> localValue
-            encodedValueHash(externalValue) > encodedValueHash(localValue) -> externalValue
-            else -> localValue
-        }
-    }
-
     private fun updatedAt(encodedValue: JSONObject): Long {
         return encodedValue.optLong(KEY_UPDATED_AT, 0L)
     }
@@ -1423,7 +1365,8 @@ class ConfigurationSyncManager(private val context: Context) {
         sectionName: String,
         prefs: SharedPreferences,
         encodedValues: JSONObject?,
-        allowedKeys: Set<String>?
+        allowedKeys: Set<String>?,
+        acceptedTypes: ((key: String) -> Set<String>)? = null
     ): Int {
         if (encodedValues == null) return 0
 
@@ -1435,6 +1378,8 @@ class ConfigurationSyncManager(private val context: Context) {
             if (allowedKeys != null && key !in allowedKeys) continue
 
             val encodedValue = encodedValues.optJSONObject(key) ?: continue
+            val accepted = acceptedTypes?.invoke(key)
+            if (accepted != null && encodedValue.optString(KEY_TYPE) !in accepted) continue
             if (putTypedValue(editor, key, encodedValue)) {
                 rememberImportedValueState(sectionName, key, encodedValue)
                 applied++
@@ -1442,6 +1387,12 @@ class ConfigurationSyncManager(private val context: Context) {
         }
         editor.apply()
         return applied
+    }
+
+    private fun presetPreferenceTypes(key: String): Set<String> = when (key) {
+        TouchPointerPresetPreferences.JSON_KEY -> setOf(TYPE_STRING, TYPE_DELETED)
+        TouchPointerPresetPreferences.DELETED_IDS_KEY -> setOf(TYPE_STRING_SET, TYPE_DELETED)
+        else -> emptySet()
     }
 
     private fun putTypedValue(
@@ -1554,30 +1505,6 @@ class ConfigurationSyncManager(private val context: Context) {
 
         profiles.sortWith(compareBy({ it.optString(KEY_CROWN_PROFILE_NAME) }, { it.optString(KEY_CROWN_PROFILE_ID) }))
         return JSONArray(profiles)
-    }
-
-    private fun mergeCrownProfiles(externalProfiles: JSONArray?, localProfiles: JSONArray?): JSONArray {
-        val profilesByHash = LinkedHashMap<String, JSONObject>()
-
-        fun addProfiles(profiles: JSONArray?) {
-            if (profiles == null) return
-            for (i in 0 until profiles.length()) {
-                val profile = profiles.optJSONObject(i) ?: continue
-                val payload = profile.optString("payload").takeIf { it.isNotBlank() } ?: continue
-                profilesByHash[payloadHash(payload)] = JSONObject()
-                    .put("sourceConfigId", 0L)
-                    .put("name", profile.optString("name", "default"))
-                    .put("payload", payload)
-            }
-        }
-
-        addProfiles(externalProfiles)
-        addProfiles(localProfiles)
-
-        val sortedProfiles = profilesByHash.values.sortedWith(
-            compareBy({ it.optString("name") }, { payloadHash(it.optString("payload")) })
-        )
-        return JSONArray(sortedProfiles)
     }
 
     private fun importCrownProfiles(profiles: JSONArray?): Pair<Int, Int> {
@@ -1859,6 +1786,7 @@ class ConfigurationSyncManager(private val context: Context) {
             .put(KEY_PAIRING_COMPUTER_NAME, details.name ?: "")
             .put(KEY_PAIRING_LOCAL_ADDRESS, encodeAddress(details.localAddress))
             .put(KEY_PAIRING_REMOTE_ADDRESS, encodeAddress(details.remoteAddress))
+            .put(KEY_PAIRING_REMOTE_FROM_STUN, details.remoteAddress != null && details.remoteAddressFromStun)
             .put(KEY_PAIRING_MANUAL_ADDRESS, encodeAddress(details.manualAddress))
             .put(KEY_PAIRING_IPV6_ADDRESS, encodeAddress(details.ipv6Address))
             .put(KEY_PAIRING_IPV6_DISABLED, details.ipv6Disabled)
@@ -1884,6 +1812,7 @@ class ConfigurationSyncManager(private val context: Context) {
             this.name = name
             localAddress = decodeAddress(encoded.optJSONObject(KEY_PAIRING_LOCAL_ADDRESS))
             remoteAddress = decodeAddress(encoded.optJSONObject(KEY_PAIRING_REMOTE_ADDRESS))
+            remoteAddressFromStun = remoteAddress != null && encoded.optBoolean(KEY_PAIRING_REMOTE_FROM_STUN, false)
             manualAddress = decodeAddress(encoded.optJSONObject(KEY_PAIRING_MANUAL_ADDRESS))
             ipv6Address = decodeAddress(encoded.optJSONObject(KEY_PAIRING_IPV6_ADDRESS))
             ipv6Disabled = encoded.optBoolean(KEY_PAIRING_IPV6_DISABLED, false)
@@ -2352,10 +2281,45 @@ class ConfigurationSyncManager(private val context: Context) {
                     )
                 )
                 .put(
+                    SECTION_OSC_SETTINGS_BUTTON,
+                    mergedPreferenceSectionCore(
+                        externalSections.optJSONObject(SECTION_OSC_SETTINGS_BUTTON),
+                        localSections.optJSONObject(SECTION_OSC_SETTINGS_BUTTON),
+                        OscSettingsButtonStore.PORTABLE_PREFERENCE_KEYS,
+                        metadata.deviceId
+                    )
+                )
+                .put(
+                    SECTION_OSC_LAYOUT_PROFILES,
+                    mergedPreferenceSectionCore(
+                        externalSections.optJSONObject(SECTION_OSC_LAYOUT_PROFILES),
+                        localSections.optJSONObject(SECTION_OSC_LAYOUT_PROFILES),
+                        null,
+                        metadata.deviceId
+                    )
+                )
+                .put(
                     SECTION_TOUCH_POINTER_PRESETS,
                     mergedTouchPointerPresetSectionCore(
                         externalSections.optJSONObject(SECTION_TOUCH_POINTER_PRESETS),
                         localSections.optJSONObject(SECTION_TOUCH_POINTER_PRESETS),
+                        metadata.deviceId
+                    )
+                )
+                .put(
+                    SECTION_TOUCHPAD_INPUT,
+                    mergedPreferenceSectionCore(
+                        externalSections.optJSONObject(SECTION_TOUCHPAD_INPUT),
+                        localSections.optJSONObject(SECTION_TOUCHPAD_INPUT),
+                        TouchpadInputPreferences.PORTABLE_KEYS,
+                        metadata.deviceId
+                    )
+                )
+                .put(
+                    SECTION_TOUCHPAD_PRESETS,
+                    mergedTouchPointerPresetSectionCore(
+                        externalSections.optJSONObject(SECTION_TOUCHPAD_PRESETS),
+                        localSections.optJSONObject(SECTION_TOUCHPAD_PRESETS),
                         metadata.deviceId
                     )
                 )
@@ -2454,6 +2418,24 @@ class ConfigurationSyncManager(private val context: Context) {
                     )
                 )
                 .put(
+                    SECTION_OSC_SETTINGS_BUTTON,
+                    mergedPreferenceSectionCore(
+                        sections.optJSONObject(SECTION_OSC_SETTINGS_BUTTON),
+                        null,
+                        OscSettingsButtonStore.PORTABLE_PREFERENCE_KEYS,
+                        "hash"
+                    )
+                )
+                .put(
+                    SECTION_OSC_LAYOUT_PROFILES,
+                    mergedPreferenceSectionCore(
+                        sections.optJSONObject(SECTION_OSC_LAYOUT_PROFILES),
+                        null,
+                        null,
+                        "hash"
+                    )
+                )
+                .put(
                     SECTION_TOUCH_POINTER_PRESETS,
                     mergedTouchPointerPresetSectionCore(
                         sections.optJSONObject(SECTION_TOUCH_POINTER_PRESETS),
@@ -2464,6 +2446,15 @@ class ConfigurationSyncManager(private val context: Context) {
                 .put(
                     SECTION_CROWN_PROFILES,
                     mergeCrownProfilesCore(sections.optJSONArray(SECTION_CROWN_PROFILES), null, "hash")
+                )
+                .put(
+                    SECTION_TOUCHPAD_INPUT,
+                    mergedPreferenceSectionCore(sections.optJSONObject(SECTION_TOUCHPAD_INPUT), null,
+                        TouchpadInputPreferences.PORTABLE_KEYS, "hash")
+                )
+                .put(
+                    SECTION_TOUCHPAD_PRESETS,
+                    mergedTouchPointerPresetSectionCore(sections.optJSONObject(SECTION_TOUCHPAD_PRESETS), null, "hash")
                 )
                 .put(
                     SECTION_PAIRING,
@@ -2858,6 +2849,7 @@ class ConfigurationSyncManager(private val context: Context) {
                 .put(KEY_PAIRING_COMPUTER_NAME, name)
                 .put(KEY_PAIRING_LOCAL_ADDRESS, normalizedPairingAddressCore(computer.optJSONObject(KEY_PAIRING_LOCAL_ADDRESS)))
                 .put(KEY_PAIRING_REMOTE_ADDRESS, normalizedPairingAddressCore(computer.optJSONObject(KEY_PAIRING_REMOTE_ADDRESS)))
+                .put(KEY_PAIRING_REMOTE_FROM_STUN, computer.optBoolean(KEY_PAIRING_REMOTE_FROM_STUN, false))
                 .put(KEY_PAIRING_MANUAL_ADDRESS, normalizedPairingAddressCore(computer.optJSONObject(KEY_PAIRING_MANUAL_ADDRESS)))
                 .put(KEY_PAIRING_IPV6_ADDRESS, normalizedPairingAddressCore(computer.optJSONObject(KEY_PAIRING_IPV6_ADDRESS)))
                 .put(KEY_PAIRING_IPV6_DISABLED, computer.optBoolean(KEY_PAIRING_IPV6_DISABLED, false))
@@ -3159,6 +3151,7 @@ class ConfigurationSyncManager(private val context: Context) {
         private const val KEY_PAIRING_PAIR_NAME = "pairName"
         private const val KEY_PAIRING_PORT = "port"
         private const val KEY_PAIRING_REMOTE_ADDRESS = "remoteAddress"
+        private const val KEY_PAIRING_REMOTE_FROM_STUN = "remoteAddressFromStun"
         private const val KEY_PAIRING_SERVER_CERTIFICATE = "serverCertificateDer"
         private const val KEY_PAIRING_UNIQUE_ID = "uniqueId"
 
@@ -3170,7 +3163,11 @@ class ConfigurationSyncManager(private val context: Context) {
         private const val SECTION_HIDDEN_APPS = "hiddenApps"
         private const val SECTION_PAIRING = "pairing"
         private const val SECTION_SCENE_CONFIGS = "sceneConfigs"
+        private const val SECTION_OSC_SETTINGS_BUTTON = "oscSettingsButton"
+        private const val SECTION_OSC_LAYOUT_PROFILES = "oscLayoutProfiles"
         private const val SECTION_TOUCH_POINTER_PRESETS = "touchPointerPresets"
+        private const val SECTION_TOUCHPAD_INPUT = "touchpadInput"
+        private const val SECTION_TOUCHPAD_PRESETS = "touchpadPresets"
 
         private const val TYPE_BOOLEAN = "boolean"
         private const val TYPE_DELETED = "deleted"
@@ -3275,6 +3272,10 @@ class ConfigurationSyncManager(private val context: Context) {
                 SCENE_CONFIGS_PREFS -> true
                 APP_VIEW_PREFS -> key in APP_VIEW_PREF_KEYS
                 TouchPointerPresetPreferences.FILE_NAME -> key in TOUCH_POINTER_PRESET_PREF_KEYS
+                TouchpadInputPreferences.PRESETS_FILE_NAME -> key in TOUCH_POINTER_PRESET_PREF_KEYS
+                TouchpadInputPreferences.FILE_NAME -> key in TouchpadInputPreferences.PORTABLE_KEYS
+                OscSettingsButtonStore.PREFERENCES_NAME -> key in OscSettingsButtonStore.PORTABLE_PREFERENCE_KEYS
+                VirtualControllerConfigurationLoader.OSC_PREFERENCE -> true
                 else -> false
             }
         }
@@ -3286,7 +3287,9 @@ class ConfigurationSyncManager(private val context: Context) {
             "background_image_url",
             "background_source",
             "checkbox_adaptive_bitrate",
+            "auto_adjust_bitrate",
             "checkbox_absolute_mouse_mode",
+            "list_mouse_axis_correction",
             "checkbox_audio_vibration",
             "checkbox_background_audio",
             "checkbox_clipboard_sync_image",
@@ -3344,14 +3347,18 @@ class ConfigurationSyncManager(private val context: Context) {
             "checkbox_resume_stream",
             "checkbox_rotable_screen",
             "checkbox_show_QuickKeyCard",
+            "checkbox_show_audio_haptics_card",
             "checkbox_show_bitrate_card",
+            "checkbox_show_display_settings_card",
             "checkbox_show_guide_button",
             "checkbox_show_gyro_card",
+            PreferenceConfiguration.SHOW_WAVEFORM_HAPTICS_CARD_PREF_STRING,
             MicrophoneButtonPreferences.KEY_SHOW_BUTTON,
             PreferenceConfiguration.SHOW_LOW_RESOLUTION_PRESETS_PREF_STRING,
             "checkbox_show_onscreen_controls",
             "checkbox_show_onscreen_keyboard",
             "checkbox_small_icon_mode",
+            "checkbox_shizuku_keyboard_accessibility",
             "checkbox_special_key_map",
             "checkbox_stretch_video",
             "checkbox_swap_quit_and_disconnect",
@@ -3369,6 +3376,7 @@ class ConfigurationSyncManager(private val context: Context) {
             "gyro_to_mouse",
             "gyro_to_right_stick",
             "list_abr_mode",
+            "list_fec_mode",
             "list_audio_codec",
             "list_audio_config",
             "list_audio_passthrough_buffer",
@@ -3403,8 +3411,10 @@ class ConfigurationSyncManager(private val context: Context) {
             "pointer_velocity_factor",
             "pref_enable_double_click_drag",
             "pref_enable_local_cursor_rendering",
+            "seekbar_hardware_touchpad_pointer_speed",
             "seekbar_audio_vibration_strength",
             "seekbar_bitrate_kbps",
+            "seekbar_fec_percentage",
             "seekbar_deadzone",
             "seekbar_double_tap_time_threshold",
             "seekbar_flat_region_pixels",
@@ -3435,7 +3445,11 @@ class ConfigurationSyncManager(private val context: Context) {
             CUSTOM_RESOLUTIONS_PREFS,
             HIDDEN_APPS_PREFS,
             SCENE_CONFIGS_PREFS,
-            TouchPointerPresetPreferences.FILE_NAME
+            TouchPointerPresetPreferences.FILE_NAME,
+            TouchpadInputPreferences.FILE_NAME,
+            TouchpadInputPreferences.PRESETS_FILE_NAME,
+            OscSettingsButtonStore.PREFERENCES_NAME,
+            VirtualControllerConfigurationLoader.OSC_PREFERENCE
         )
     }
 }

@@ -1,5 +1,6 @@
 package com.limelight.binding.video
 
+import com.limelight.R
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
@@ -17,12 +18,13 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import com.limelight.BuildConfig
 import com.limelight.LimeLog
+import com.limelight.framegen.FramegenInterceptor
 import com.limelight.nvstream.HdrModePolicy
+import com.limelight.nvstream.PyrowaveDynamicHdrPolicy
 import com.limelight.nvstream.ColorRangePolicy
 import com.limelight.nvstream.av.video.VideoDecoderRenderer
 import com.limelight.nvstream.jni.MoonBridge
 import com.limelight.preferences.PreferenceConfiguration
-import org.jcodec.codecs.h264.io.model.SeqParameterSet
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -37,10 +39,11 @@ class MediaCodecDecoderRenderer(
     private val crashListener: CrashListener,
     private val consecutiveCrashCount: Int,
     meteredData: Boolean,
-    requestedHdr: Boolean,
+    private var requestedHdr: Boolean,
     initialHdr10PlusRequested: Boolean,
     private val glRenderer: String,
-    private val perfListener: PerfOverlayListener
+    private val perfListener: PerfOverlayListener,
+    private val pyrowaveFailureListener: (String) -> Unit,
 ) : VideoDecoderRenderer() {
 
     companion object {
@@ -90,13 +93,18 @@ class MediaCodecDecoderRenderer(
     private val ppsBuffers = ArrayList<ByteArray>()
     private var submittedCsd = false
     private var currentHdrMetadata: ByteArray? = null
+    private var pyrowaveTargetPeakNits = 500f
+    private var pyrowaveNegotiatedDynamicHdr = MoonBridge.NEGOTIATED_DYNAMIC_HDR_NONE
     private var hdrDataSpace = 0 // Configured DataSpace for HDR content, re-applied after format changes
 
     private var nextInputBufferIndex = -1
     private var nextInputBuffer: ByteBuffer? = null
+    @Volatile
+    private var requiredInputBufferSize = 0
 
     private val context: Context = activity
     private val activity: Activity = activity
+    @Volatile
     private var videoDecoder: MediaCodec? = null
     @Volatile
     private var dolbyVisionRoutingActive = false
@@ -152,6 +160,16 @@ class MediaCodecDecoderRenderer(
     private var initialHeight = 0
     private var videoFormat = 0
     private var renderTarget: SurfaceHolder? = null
+    private val pyrowaveDecoder = PyrowaveDecoderSession(
+        gpuNative = FramegenPyrowaveNativeApi,
+        onFatalFailure = { reason -> failPyrowaveSession(reason) },
+    )
+    @Volatile
+    private var pyrowavePreflightAvailable = false
+    private val pyrowaveStopPosted = AtomicBoolean(false)
+
+    private val pyrowaveDecoderActive: Boolean
+        get() = pyrowaveDecoder.isActive
     /**
      * 阶段 3 framegen 注入点：非 null 时，MediaCodec.configure() 用该 Surface 替代
      * renderTarget.surface，把解码帧导向 ImageReader 而不是直接上屏。null 表示走原路径。
@@ -186,9 +204,6 @@ class MediaCodecDecoderRenderer(
     private val decoderConfigurationTracker = DecoderConfigurationTracker()
     @Volatile
     private var decoderConfigurationDirty = false
-
-    private var needsBaselineSpsHack = false
-    private var savedSps: SeqParameterSet? = null
 
     private var initialException: RendererException? = null
     private var initialExceptionTimestamp: Long = 0
@@ -408,8 +423,100 @@ class MediaCodecDecoderRenderer(
         return decoderInfo
     }
 
-    fun setRenderTarget(renderTarget: SurfaceHolder) {
+    fun isPyrowaveSupported(width: Int, height: Int, hdrMode: Int = pyrowaveHdrMode()): Boolean {
+        // The Vulkan/Surface decoder lives in the arm64-only framegen
+        // library; FramegenInterceptor reports it unavailable on 32-bit
+        // devices. Every packaged ABI carries libpyrowave-shared.so, so SDR
+        // streams can still use the CPU staging bridge there.
+        val gpuAvailable = FramegenInterceptor.isPyrowaveAvailableFor(width, height, hdrMode)
+        // HDR has no safe CPU fallback. SDR can use the CPU bring-up path on
+        // devices without the Vulkan Surface library.
+        return gpuAvailable || (hdrMode == 0 && MoonBridge.pyrowaveIsAvailableFor(width, height))
+    }
+
+    override fun canInitializePyrowave(width: Int, height: Int, hdrMode: Int, fullRange: Boolean): Boolean {
+        val surface = renderTarget?.surface
+        return surface != null && surface.isValid &&
+            isPyrowaveSupported(width, height, hdrMode) &&
+            pyrowaveDecoder.canCreate(width, height, hdrMode, fullRange,
+                dynamicHdrFormat = if (hdrMode != 0) PyrowaveDynamicHdrPolicy.formatForSelection(prefs.hdrMode) else 0,
+                targetPeakNits = pyrowaveTargetPeakNits)
+    }
+
+    override fun setPyrowavePreflightResult(available: Boolean) {
+        pyrowavePreflightAvailable = available
+    }
+
+    private fun pyrowaveHdrMode(): Int =
+        if (requestedHdr) HdrModePolicy.toProtocolMode(prefs.hdrMode) else 0
+
+    fun setPyrowaveTargetPeak(peakNits: Float) {
+        if (peakNits.isFinite() && peakNits in 1f..10000f) pyrowaveTargetPeakNits = peakNits
+    }
+
+    // The stream builder uses this same preference for StreamConfig.colorRange;
+    // keep the decoder contract aligned without rewriting the saved setting.
+    private fun pyrowaveFullRange(): Boolean =
+        ColorRangePolicy.isFullRange(getPreferredColorRange())
+
+    private fun pyrowaveHdrMetadataForCreate(): ByteArray? {
+        return currentHdrMetadata?.copyOf()
+    }
+
+    override fun setRenderTarget(renderTarget: SurfaceHolder?) {
         this.renderTarget = renderTarget
+        pyrowaveDecoder.setSurface(renderTarget?.surface)
+    }
+
+    private fun destroyPyrowaveDecoder() {
+        pyrowaveDecoder.destroy()
+    }
+
+    private fun recreatePyrowaveDecoder(width: Int = initialWidth, height: Int = initialHeight): Boolean {
+        val hdrMode = pyrowaveHdrMode()
+        return pyrowaveDecoder.create(
+            width,
+            height,
+            hdrMode,
+            pyrowaveFullRange(),
+            hdrEnabled = hdrMode != 0,
+            hdrMetadata = pyrowaveHdrMetadataForCreate(),
+            dynamicHdrFormat = pyrowaveNegotiatedDynamicHdr,
+            targetPeakNits = pyrowaveTargetPeakNits,
+        )
+    }
+
+    /** Apply the final HDR decision before common-c queries renderer capabilities. */
+    fun setStreamHdrRequested(enabled: Boolean) {
+        requestedHdr = enabled
+    }
+
+    private fun failPyrowaveSession(reason: String) {
+        destroyPyrowaveDecoder()
+        val shouldNotifyConnectionFailure = !stopping && pyrowaveStopPosted.compareAndSet(false, true)
+        stopping = true
+        if (shouldNotifyConnectionFailure) {
+            // Let the existing connection callback path serialize NvConnection
+            // shutdown, UI error reporting, and resource cleanup. The callback
+            // performs its network stop work off the main thread.
+            //
+            // Deliberately not routed through crashListener: pyrowaveFailureListener
+            // owns PyroWave termination (and crash accounting), so a fatal PyroWave
+            // failure ends the stream exactly once.
+            Thread {
+                try {
+                    pyrowaveFailureListener(reason)
+                } catch (e: RuntimeException) {
+                    LimeLog.warning("Failed to report PyroWave connection failure: ${e.message}")
+                }
+            }.apply { name = "PyroWaveFailure" }.start()
+        }
+    }
+
+    private fun recoverPyrowaveDecoder(reason: String): Int {
+        val fatal = pyrowaveDecoder.noteRecoveryFailure(reason)
+        LimeLog.warning("PyroWave decoder recovery ${if (fatal) "failed" else "scheduled"}: $reason")
+        return MoonBridge.DR_NEED_IDR
     }
 
     fun setFramegenCaptureSwitchReady(ready: Boolean) {
@@ -728,7 +835,25 @@ class MediaCodecDecoderRenderer(
 
         // 重新初始化解码器
         // 注意：initialWidth, initialHeight 等变量依然保留着
-        initializeDecoder(false)
+        if (videoFormat == MoonBridge.VIDEO_FORMAT_PYROWAVE) {
+            if (recreatePyrowaveDecoder()) {
+                isProcessingPaused = false
+            } else {
+                isProcessingPaused = false
+                recoverPyrowaveDecoder("resume")
+            }
+            return
+        }
+        val err = initializeDecoder(false)
+        if (err != 0) {
+            // 所有解码器配置都失败时 videoDecoder 为 null，不能当作已恢复继续送帧；
+            // 走正常的渲染器失败回调结束串流，而不是在输入线程 NPE 闪退。
+            LimeLog.severe("Failed to reinitialize decoder on resume: $err")
+            stopping = true
+            isProcessingPaused = false
+            notifyCrashOnce(IllegalStateException("Decoder reinitialization on resume failed: $err"))
+            return
+        }
 
         // 重新启动渲染线程等
         start()
@@ -878,6 +1003,15 @@ class MediaCodecDecoderRenderer(
         hdr10PlusOutputObserver.restartCodecConfiguration()
         stableOutputFormatTracker.reset()
 
+        // Keep the observed access-unit requirement across restarts, resets, and full rebuilds.
+        // Configuration fallbacks must not revert to buffers that already proved too small.
+        if (requiredInputBufferSize > 0) {
+            val requestedSize = if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
+            } else 0
+            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, maxOf(requestedSize, requiredInputBufferSize))
+        }
+
         // Set HDR metadata if present
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             if (currentHdrMetadata != null) {
@@ -941,19 +1075,36 @@ class MediaCodecDecoderRenderer(
         framegenOutputSwitchRetryCount.set(0)
         framegenOutputSwitchPending =
             pendingFramegenSurface != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+        // The render target is released concurrently with codec recovery (activity relaunch,
+        // stream stop). Fail with the exception type every configureAndStartDecoder caller
+        // already treats as an invalid surface instead of crashing on a null dereference.
+        fun directOutputSurface(): Surface =
+            renderTarget?.surface
+                ?: throw IllegalArgumentException("Render target was released before decoder configuration")
         val outSurface = if (framegenOutputSwitchPending) {
             LimeLog.info(
                 "Framegen delayed capture active: decoder starts on SurfaceView " +
                     "and will switch to ImageReader after first direct frame"
             )
-            renderTarget!!.surface
+            directOutputSurface()
         } else {
             if (pendingFramegenSurface != null) {
                 LimeLog.info("Framegen capture surface active (decoder output redirected to ImageReader)")
             }
-            pendingFramegenSurface ?: renderTarget!!.surface
+            pendingFramegenSurface ?: directOutputSurface()
         }
-        videoDecoder!!.configure(format, outSurface, null, 0)
+        try {
+            videoDecoder!!.configure(format, outSurface, null, 0)
+        } catch (e: IllegalArgumentException) {
+            // Keep growth rejection out of recovery's invalid-surface handlers. The state-error
+            // path tries reset/recreation and all configuration candidates before reporting failure.
+            if (requiredInputBufferSize > 0 && !stopping && outSurface.isValid) {
+                throw IllegalStateException(
+                    "Decoder rejected input buffer size $requiredInputBufferSize: ${e.message}", e
+                )
+            }
+            throw e
+        }
 
         // Set DataSpace on the output Surface for HDR content.
         // Equivalent to HarmonyOS OH_NativeWindow_SetColorSpace().
@@ -964,7 +1115,7 @@ class MediaCodecDecoderRenderer(
                 prefs.hdrMode,
                 getPreferredColorRange(),
             )
-            applyHdrDataSpace(renderTarget!!.surface, "decoder output")
+            applyHdrDataSpace(directOutputSurface(), "decoder output")
         }
 
         configuredFormat = format
@@ -974,6 +1125,7 @@ class MediaCodecDecoderRenderer(
         vpsBuffers.clear()
         spsBuffers.clear()
         ppsBuffers.clear()
+        spsPatcher?.onCodecConfigured()
         clearTimestampTracking()
 
         // This will contain the actual accepted input format attributes
@@ -1176,7 +1328,7 @@ class MediaCodecDecoderRenderer(
 
             // These fixups only apply to H264 decoders
             needsSpsBitstreamFixup = MediaCodecHelper.decoderNeedsSpsBitstreamRestrictions(selectedDecoderInfo.name)
-            needsBaselineSpsHack = MediaCodecHelper.decoderNeedsBaselineSpsHack(selectedDecoderInfo.name)
+            val needsBaselineSpsHack = MediaCodecHelper.decoderNeedsBaselineSpsHack(selectedDecoderInfo.name)
             constrainedHighProfile = MediaCodecHelper.decoderNeedsConstrainedHighProfile(selectedDecoderInfo.name)
             isExynos4 = MediaCodecHelper.isExynos4Device()
             if (needsSpsBitstreamFixup) {
@@ -1196,7 +1348,7 @@ class MediaCodecDecoderRenderer(
 
             spsPatcher = SpsPatcher(
                 constrainedHighProfile, needsSpsBitstreamFixup,
-                isExynos4, hevcDecoder != null, av1Decoder != null
+                isExynos4, hevcDecoder != null, av1Decoder != null, needsBaselineSpsHack
             )
         } else if ((videoFormat and MoonBridge.VIDEO_FORMAT_MASK_H265) != 0) {
             // Dolby Vision Profile 8 routing: the wire stream is HEVC either
@@ -1365,12 +1517,31 @@ class MediaCodecDecoderRenderer(
     override fun setup(format: Int, width: Int, height: Int, redrawRate: Int): Int {
         this.initialWidth = width
         this.initialHeight = height
+        requiredInputBufferSize = 0
         synchronized(decoderConfigurationLock) {
             decoderConfigurationTracker.reset(width, height)
             decoderConfigurationDirty = false
         }
         this.videoFormat = format
         this.refreshRate = redrawRate
+
+        if (format == MoonBridge.VIDEO_FORMAT_PYROWAVE) {
+            pyrowaveDecoder.reset()
+            pyrowaveStopPosted.set(false)
+            val hdrMode = pyrowaveHdrMode()
+            pyrowaveNegotiatedDynamicHdr = MoonBridge.getNegotiatedDynamicHdrFormat()
+            val requestedDynamic = if (hdrMode != 0) PyrowaveDynamicHdrPolicy.formatForSelection(prefs.hdrMode) else 0
+            if (pyrowaveNegotiatedDynamicHdr != requestedDynamic) {
+                LimeLog.warning("PyroWave dynamic HDR mismatch: requested=$requestedDynamic negotiated=$pyrowaveNegotiatedDynamicHdr")
+                return -1
+            }
+            if (!recreatePyrowaveDecoder(width, height)) {
+                LimeLog.warning("PyroWave decoder initialization failed")
+                return -1
+            }
+            LimeLog.info("PyroWave decoder initialized for ${width}x$height gpu=${pyrowaveDecoder.isGpu}")
+            return 0
+        }
 
         // Async codec mode (API 30+)
         this.asyncModeEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
@@ -1417,10 +1588,7 @@ class MediaCodecDecoderRenderer(
                         val failure = IllegalStateException(
                             "Decoder configuration did not settle after $recoveryPasses recovery passes"
                         )
-                        if (!reportedCrash) {
-                            reportedCrash = true
-                            crashListener.notifyCrash(failure)
-                        }
+                        notifyCrashOnce(failure)
                         throw RendererException(createDiagnostics(), failure)
                     }
                     recoveryPasses++
@@ -1529,10 +1697,7 @@ class MediaCodecDecoderRenderer(
                             codecRecoveryType.set(CR_RECOVERY_TYPE_NONE)
                         } catch (e: IllegalStateException) {
                             // If we failed to recover after all of these attempts, just crash
-                            if (!reportedCrash) {
-                                reportedCrash = true
-                                crashListener.notifyCrash(e)
-                            }
+                            notifyCrashOnce(e)
                             throw RendererException(createDiagnostics(), e)
                         }
                     }
@@ -1582,6 +1747,14 @@ class MediaCodecDecoderRenderer(
     }
 
     // Returns true if the exception is transient
+    /** Report a fatal renderer error to the crash listener exactly once. */
+    private fun notifyCrashOnce(e: Exception) {
+        if (!reportedCrash) {
+            reportedCrash = true
+            crashListener.notifyCrash(e)
+        }
+    }
+
     private fun handleDecoderException(e: IllegalStateException): Boolean {
         // Eat decoder exceptions if we're in the process of stopping
         if (stopping) {
@@ -1664,12 +1837,13 @@ class MediaCodecDecoderRenderer(
             if (initialException != null) {
                 // This isn't the first time we've had an exception processing video
                 if (SystemClock.uptimeMillis() - initialExceptionTimestamp >= EXCEPTION_REPORT_DELAY_MS) {
-                    // It's been over 3 seconds and we're still getting exceptions. Throw the original now.
-                    if (!reportedCrash) {
-                        reportedCrash = true
-                        crashListener.notifyCrash(initialException!!)
-                    }
-                    throw initialException!!
+                    // It's been over 3 seconds and we're still getting exceptions. Stop the
+                    // decode pipeline first (the crash listener terminates the stream via
+                    // the standard failure path, which does network work), then report the
+                    // failure. Throwing from here would escape the codec callback (or sync
+                    // submit) thread and kill the whole process.
+                    stopping = true
+                    notifyCrashOnce(initialException!!)
                 }
             } else {
                 // This is the first exception we've hit
@@ -1888,6 +2062,10 @@ class MediaCodecDecoderRenderer(
 
         startTime = SystemClock.uptimeMillis()
 
+        // A failed codec reset/reconfiguration leaves videoDecoder null. Use one snapshot so a
+        // concurrent release surfaces as a handled IllegalStateException rather than an NPE.
+        val decoder = videoDecoder ?: return false
+
         try {
             // If we don't have an input buffer index yet, fetch one now
             if (asyncModeEnabled) {
@@ -1906,7 +2084,7 @@ class MediaCodecDecoderRenderer(
             } else {
                 // Sync mode: poll the decoder directly
                 while (nextInputBufferIndex < 0 && !stopping) {
-                    nextInputBufferIndex = videoDecoder!!.dequeueInputBuffer(5000)
+                    nextInputBufferIndex = decoder.dequeueInputBuffer(5000)
                 }
             }
 
@@ -1914,7 +2092,7 @@ class MediaCodecDecoderRenderer(
             if (nextInputBufferIndex >= 0) {
                 // Using the new getInputBuffer() API on Lollipop allows
                 // the framework to do some performance optimizations for us
-                nextInputBuffer = videoDecoder!!.getInputBuffer(nextInputBufferIndex)
+                nextInputBuffer = decoder.getInputBuffer(nextInputBufferIndex)
                 if (nextInputBuffer == null) {
                     // According to the Android docs, getInputBuffer() can return null "if the
                     // index is not a dequeued input buffer". I don't think this ever should
@@ -1954,10 +2132,7 @@ class MediaCodecDecoderRenderer(
             // so generate a decoder hung exception
             if (deltaMs >= 5000 && initialException == null) {
                 val decoderHungException = DecoderHungException(deltaMs)
-                if (!reportedCrash) {
-                    reportedCrash = true
-                    crashListener.notifyCrash(decoderHungException)
-                }
+                notifyCrashOnce(decoderHungException)
                 throw RendererException(createDiagnostics(), decoderHungException)
             }
 
@@ -1968,6 +2143,9 @@ class MediaCodecDecoderRenderer(
     }
 
     override fun start() {
+        if (pyrowaveDecoderActive) {
+            return
+        }
         startRendererThread()
         framePacingController.start(videoDecoder!!, refreshRate)
 
@@ -1999,6 +2177,10 @@ class MediaCodecDecoderRenderer(
     }
 
     override fun stop() {
+        if (pyrowaveDecoderActive) {
+            stopping = true
+            return
+        }
         // May be called already, but we'll call it now to be safe
         prepareForStop()
 
@@ -2020,6 +2202,8 @@ class MediaCodecDecoderRenderer(
     }
 
     override fun cleanup() {
+        destroyPyrowaveDecoder()
+        currentHdrMetadata = null
         dolbyVisionRoutingActive = false
         if (videoDecoder != null) {
             try {
@@ -2039,9 +2223,29 @@ class MediaCodecDecoderRenderer(
     }
 
     override fun setHdrMode(enabled: Boolean, hdrMetadata: ByteArray?) {
+        // The host state is still needed by diagnostics even though PyroWave
+        // does not use a MediaCodec instance or its recovery state machine.
+        hdr10PlusOutputObserver.onHostHdrMode(enabled)
+        if (videoFormat == MoonBridge.VIDEO_FORMAT_PYROWAVE) {
+            val negotiatedPyrowaveHdr = pyrowaveHdrMode() != 0
+            if (enabled != negotiatedPyrowaveHdr) {
+                // The PyroWave bitstream and swapchain color space are fixed
+                // for the RTSP session. Do not keep presenting SDR through an
+                // HDR swapchain (or vice versa); let the existing connection
+                // recovery path renegotiate a compatible codec.
+                failPyrowaveSession("PyroWave HDR mode changed during the session")
+                return
+            }
+            val negotiatedPyrowaveHdrMode = pyrowaveHdrMode()
+            if (pyrowaveDecoder.setHdrMetadata(enabled, hdrMetadata)) {
+                currentHdrMetadata = PyrowaveHdrMetadata.updatedSnapshot(currentHdrMetadata, enabled, hdrMetadata)
+            } else if (negotiatedPyrowaveHdrMode != 0) {
+                failPyrowaveSession("Static HDR metadata could not be applied to the Vulkan Surface")
+            }
+            return
+        }
         // The enabled flag is the authoritative stream HDR state. Static metadata may be absent
         // for HLG, NVIDIA GameStream, or a valid Sunshine HDR transition.
-        hdr10PlusOutputObserver.onHostHdrMode(enabled)
 
         // Dolby Vision mastering and mapping updates are carried in-band by the RPU.
         // Restarting an active DV codec for generic HDR static metadata can leave some
@@ -2083,6 +2287,39 @@ class MediaCodecDecoderRenderer(
     }
 
     override fun onResolutionChanged(width: Int, height: Int) {
+        if (videoFormat == MoonBridge.VIDEO_FORMAT_PYROWAVE) {
+            val changed = synchronized(decoderConfigurationLock) {
+                width != initialWidth || height != initialHeight
+            }
+            if (!changed) {
+                return
+            }
+
+            // Remember the new geometry before creating the replacement. If
+            // creation fails, the bounded recovery path must retry the new
+            // dimensions rather than repeatedly recreating the old decoder.
+            synchronized(decoderConfigurationLock) {
+                decoderConfigurationTracker.updateResolution(width, height)
+                initialWidth = width
+                initialHeight = height
+            }
+
+            // Create the replacement before destroying the current decoder. If
+            // creation fails, the old handle cannot consume the new dimensions.
+            if (!recreatePyrowaveDecoder(width, height)) {
+                LimeLog.warning("PyroWave decoder could not be recreated for ${width}x$height")
+                pyrowaveDecoder.destroy()
+                recoverPyrowaveDecoder("resolution change to ${width}x$height")
+                return
+            }
+            firstFrameDelivered = false
+            lastFrameNumber = 0
+            activeWindowVideoStats.clear()
+            activeWindowVideoStats.measurementStartTimestamp = SystemClock.uptimeMillis()
+            LimeLog.info("PyroWave decoder recreated for ${width}x$height")
+            return
+        }
+
         val (previousWidth, previousHeight, needsRestart) = synchronized(decoderConfigurationLock) {
             if (width == initialWidth && height == initialHeight) {
                 return
@@ -2113,12 +2350,91 @@ class MediaCodecDecoderRenderer(
         }
     }
 
+    private fun publishPyrowavePerformanceIfDue(nowMs: Long) {
+        if (activeWindowVideoStats.measurementStartTimestamp == 0L ||
+            nowMs < activeWindowVideoStats.measurementStartTimestamp + 1000
+        ) {
+            return
+        }
+
+        val lastTwo = VideoStats()
+        lastTwo.add(lastWindowVideoStats)
+        lastTwo.add(activeWindowVideoStats)
+        val fps = lastTwo.getFps()
+        val receivedFrames = lastTwo.totalFramesReceived.coerceAtLeast(1)
+        val totalFrames = lastTwo.totalFrames.coerceAtLeast(1)
+        val decoderTimeMs = lastTwo.decoderTimeMs.toFloat() / receivedFrames
+        val lostFrameRate = lastTwo.framesLost.toFloat() / totalFrames * 100
+        val minHostProcessingLatency = lastTwo.minHostProcessingLatency.code.toFloat() / 10
+        val maxHostProcessingLatency = lastTwo.maxHostProcessingLatency.code.toFloat() / 10
+        val hostLatencyFrames = lastTwo.framesWithHostProcessingLatency.coerceAtLeast(1)
+        val aveHostProcessingLatency =
+            lastTwo.totalHostProcessingLatency.toFloat() / 10 / hostLatencyFrames
+        val pyrowaveTimingFrames = lastTwo.pyrowaveTimingFrames
+        val avePyrowaveDecodeTimeMs = if (pyrowaveTimingFrames > 0) {
+            lastTwo.pyrowaveDecodeTimeUs.toFloat() / pyrowaveTimingFrames / 1000f
+        } else {
+            0f
+        }
+        val avePyrowavePresentTimeMs = if (pyrowaveTimingFrames > 0) {
+            lastTwo.pyrowavePresentTimeUs.toFloat() / pyrowaveTimingFrames / 1000f
+        } else {
+            0f
+        }
+        val aveTotalProcessingTimeMs = if (lastTwo.totalFramesRendered > 0) {
+            lastTwo.totalTimeMs.toFloat() / lastTwo.totalFramesRendered
+        } else {
+            0f
+        }
+
+        val performanceInfo = PerformanceInfo()
+        performanceInfo.context = context
+        performanceInfo.initialWidth = initialWidth
+        performanceInfo.initialHeight = initialHeight
+        performanceInfo.decoder = if (pyrowaveDecoder.isGpu) {
+            "PyroWave (Vulkan Surface)"
+        } else {
+            "PyroWave (CPU staging)"
+        }
+        performanceInfo.totalFps = fps.totalFps
+        performanceInfo.receivedFps = fps.receivedFps
+        performanceInfo.renderedFps = fps.renderedFps
+        performanceInfo.lostFrameRate = lostFrameRate
+        performanceInfo.rttInfo = MoonBridge.getEstimatedRttInfo()
+        performanceInfo.framesWithHostProcessingLatency = lastTwo.framesWithHostProcessingLatency
+        val hdr10PlusRuntime = hdr10PlusOutputObserver.snapshot()
+        performanceInfo.hdrFormat = PyrowaveHdrFormatPolicy.resolve(
+            hdrEnabled = hdr10PlusRuntime.streamState == HdrStreamState.ENABLED,
+            hdrStateKnown = hdr10PlusRuntime.streamState != HdrStreamState.UNKNOWN,
+            hdrMode = pyrowaveHdrMode(),
+            appliedDynamicFormat = pyrowaveDecoder.appliedDynamicHdrFormat,
+        )
+        performanceInfo.minHostProcessingLatency = minHostProcessingLatency
+        performanceInfo.maxHostProcessingLatency = maxHostProcessingLatency
+        performanceInfo.aveHostProcessingLatency = aveHostProcessingLatency
+        performanceInfo.decodeTimeMs = decoderTimeMs
+        performanceInfo.pyrowaveDecodeTimeMs = avePyrowaveDecodeTimeMs
+        performanceInfo.pyrowavePresentTimeMs = avePyrowavePresentTimeMs
+        performanceInfo.pyrowaveTimingFrames = pyrowaveTimingFrames
+        performanceInfo.renderingLatencyMs = maxOf(0f, aveTotalProcessingTimeMs - decoderTimeMs)
+        performanceInfo.totalTimeMs = aveTotalProcessingTimeMs
+        performanceInfo.onePercentLowFps = frameIntervalTracker.getOnePercentLowFps()
+
+        perfListener.onPerfUpdateV(performanceInfo)
+        perfListener.onPerfUpdateWG(performanceInfo)
+        globalVideoStats.add(activeWindowVideoStats)
+        lastWindowVideoStats.copy(activeWindowVideoStats)
+        activeWindowVideoStats.clear()
+        activeWindowVideoStats.measurementStartTimestamp = nowMs
+    }
+
     private fun queueNextInputBuffer(
         timestampUs: Long,
         codecFlags: Int,
         hostPresentationTimeUs: Long = -1L,
     ): Boolean {
         val codecRecovered: Boolean
+        val decoder = videoDecoder ?: return false
 
         try {
             // Record the enqueue time for this timestamp
@@ -2136,7 +2452,7 @@ class MediaCodecDecoderRenderer(
                         nextInputBuffer!!.flip()
                         mapped.put(nextInputBuffer!!)
 
-                        videoDecoder!!.getQueueRequest(nextInputBufferIndex)
+                        decoder.getQueueRequest(nextInputBufferIndex)
                             .setLinearBlock(block, 0, dataSize)
                             .setPresentationTimeUs(timestampUs)
                             .setFlags(codecFlags)
@@ -2149,13 +2465,13 @@ class MediaCodecDecoderRenderer(
                     LimeLog.warning("LinearBlock failed, falling back: " + e.message)
                     linearBlockEnabled = false
                     nextInputBuffer!!.flip()
-                    videoDecoder!!.queueInputBuffer(
+                    decoder.queueInputBuffer(
                         nextInputBufferIndex,
                         0, nextInputBuffer!!.limit(), timestampUs, codecFlags
                     )
                 }
             } else {
-                videoDecoder!!.queueInputBuffer(
+                decoder.queueInputBuffer(
                     nextInputBufferIndex,
                     0, nextInputBuffer!!.position(),
                     timestampUs, codecFlags
@@ -2228,10 +2544,144 @@ class MediaCodecDecoderRenderer(
         receiveTimeUs: Long,
         enqueueTimeUs: Long,
         hostPresentationTimeUs: Long
+    ): Int = submitDecodeUnitWithMetadata(decodeUnitData, decodeUnitLength, decodeUnitType, frameNumber,
+                                         frameType, frameHostProcessingLatency, receiveTimeUs, enqueueTimeUs,
+                                         hostPresentationTimeUs, null)
+
+    override fun submitPyrowaveDecodeUnit(
+        decodeUnitData: ByteArray, decodeUnitLength: Int, decodeUnitType: Int,
+        frameNumber: Int, frameType: Int, frameHostProcessingLatency: Char,
+        receiveTimeUs: Long, enqueueTimeUs: Long, hostPresentationTimeUs: Long,
+        frameMetadata: ByteArray?,
+    ): Int = submitDecodeUnitWithMetadata(decodeUnitData, decodeUnitLength, decodeUnitType, frameNumber,
+                                         frameType, frameHostProcessingLatency, receiveTimeUs, enqueueTimeUs,
+                                         hostPresentationTimeUs, frameMetadata)
+
+    private fun codecConfigSize(): Long =
+        vpsBuffers.sumOf { it.size.toLong() } +
+            spsBuffers.sumOf { it.size.toLong() } + ppsBuffers.sumOf { it.size.toLong() }
+
+    /** Returns false when reconfiguration invalidated the current frame and a new IDR is needed. */
+    private fun ensureInputBufferCapacity(additionalBytes: Long): Boolean {
+        val buffer = nextInputBuffer!!
+        if (additionalBytes <= buffer.remaining()) return true
+
+        val requiredSize = buffer.position().toLong() + additionalBytes
+        val expandedSize = if (prefs.decoderInputBufferMode != DecoderInputBufferMode.FORCE_DISABLED &&
+            codecRecoveryAttempts < CR_MAX_TRIES
+        ) {
+            DecoderInputBufferSizing.expandedInputSize(requiredSize, buffer.limit(), requiredInputBufferSize)
+        } else null
+
+        if (expandedSize == null) {
+            val exception = IllegalArgumentException(
+                "Decode unit length $requiredSize too large for input buffer ${buffer.limit()} " +
+                    "(requested $requiredInputBufferSize)"
+            )
+            notifyCrashOnce(exception)
+            throw RendererException(createDiagnostics(), exception)
+        }
+
+        LimeLog.warning("Growing decoder input buffer: ${buffer.limit()} -> $expandedSize (required $requiredSize)")
+        requiredInputBufferSize = expandedSize
+        // Reuse the existing quiescence protocol; never reconfigure while output threads use the codec.
+        if (!codecRecoveryType.compareAndSet(CR_RECOVERY_TYPE_NONE, CR_RECOVERY_TYPE_RESTART)) {
+            codecRecoveryType.compareAndSet(CR_RECOVERY_TYPE_FLUSH, CR_RECOVERY_TYPE_RESTART)
+        }
+        doCodecRecoveryIfRequired(CR_FLAG_INPUT_THREAD)
+        return false
+    }
+
+    @Suppress("deprecation")
+    private fun submitDecodeUnitWithMetadata(
+        decodeUnitData: ByteArray, decodeUnitLength: Int, decodeUnitType: Int,
+        frameNumber: Int, frameType: Int, frameHostProcessingLatency: Char,
+        receiveTimeUs: Long, enqueueTimeUs: Long, hostPresentationTimeUs: Long,
+        frameMetadata: ByteArray?,
     ): Int {
         if (stopping || isProcessingPaused) {
             // Don't bother if we're stopping or paused
             return MoonBridge.DR_OK
+        }
+
+        if (pyrowaveDecoderActive) {
+            val decodeStartNs = SystemClock.elapsedRealtimeNanos()
+            when (pyrowaveDecoder.submit(decodeUnitData, decodeUnitLength, frameMetadata)) {
+                PyrowaveDecoderSession.SubmitResult.SUCCESS -> Unit
+                PyrowaveDecoderSession.SubmitResult.FRAME_DROPPED ->
+                    // Keep the last successfully presented frame visible.
+                    // A single incomplete frame must not recreate the
+                    // decoder or request an IDR.
+                    return MoonBridge.DR_OK
+                PyrowaveDecoderSession.SubmitResult.SURFACE_UNAVAILABLE -> return MoonBridge.DR_OK
+                PyrowaveDecoderSession.SubmitResult.INACTIVE ->
+                    return recoverPyrowaveDecoder("decoder handle unavailable at frame $frameNumber")
+                PyrowaveDecoderSession.SubmitResult.RECOVERED,
+                PyrowaveDecoderSession.SubmitResult.RETRYING,
+                PyrowaveDecoderSession.SubmitResult.FATAL -> {
+                    LimeLog.warning("PyroWave decode/present failed for frame $frameNumber")
+                    // The session has already bounded the recovery attempt and
+                    // recreated the handle when possible. Ask the host for a
+                    // fresh intra frame; a fatal session is reported through
+                    // the existing connection callback path.
+                    return MoonBridge.DR_NEED_IDR
+                }
+            }
+            val nowMs = SystemClock.uptimeMillis()
+            if (activeWindowVideoStats.measurementStartTimestamp == 0L) {
+                activeWindowVideoStats.measurementStartTimestamp = nowMs
+            }
+            if (lastFrameNumber != 0 && frameNumber > lastFrameNumber + 1) {
+                val framesLost = frameNumber - lastFrameNumber - 1
+                activeWindowVideoStats.framesLost += framesLost
+                activeWindowVideoStats.totalFrames += framesLost
+                activeWindowVideoStats.frameLossEvents++
+                perfListener.onVideoFrameLoss(framesLost, frameNumber)
+            }
+            lastFrameNumber = frameNumber
+            activeWindowVideoStats.totalFramesReceived++
+            activeWindowVideoStats.totalFrames++
+            activeWindowVideoStats.totalFramesRendered++
+            val pyrowaveTimings = pyrowaveDecoder.latestFrameTimings
+            if (pyrowaveTimings.isValid) {
+                activeWindowVideoStats.pyrowaveDecodeTimeUs += pyrowaveTimings.decodeTimeUs
+                activeWindowVideoStats.pyrowavePresentTimeUs += pyrowaveTimings.presentTimeUs
+                activeWindowVideoStats.pyrowaveTimingFrames++
+            }
+            frameIntervalTracker.recordFrame()
+            val decodeTimeMs = (SystemClock.elapsedRealtimeNanos() - decodeStartNs) / 1_000_000L
+            activeWindowVideoStats.decoderTimeMs += decodeTimeMs
+            activeWindowVideoStats.totalTimeMs += decodeTimeMs
+            if (frameHostProcessingLatency.code != 0) {
+                if (activeWindowVideoStats.minHostProcessingLatency.code != 0) {
+                    activeWindowVideoStats.minHostProcessingLatency =
+                        minOf(activeWindowVideoStats.minHostProcessingLatency, frameHostProcessingLatency)
+                } else {
+                    activeWindowVideoStats.minHostProcessingLatency = frameHostProcessingLatency
+                }
+                activeWindowVideoStats.framesWithHostProcessingLatency++
+            }
+            activeWindowVideoStats.maxHostProcessingLatency =
+                maxOf(activeWindowVideoStats.maxHostProcessingLatency, frameHostProcessingLatency)
+            activeWindowVideoStats.totalHostProcessingLatency += frameHostProcessingLatency.code
+            publishPyrowavePerformanceIfDue(nowMs)
+            numFramesIn++
+            if (!firstFrameDelivered) {
+                firstFrameDelivered = true
+                try { firstFrameCallback?.invoke() } catch (_: Throwable) {}
+            }
+            return MoonBridge.DR_OK
+        }
+
+        if (videoFormat == MoonBridge.VIDEO_FORMAT_PYROWAVE) {
+            // Do not route a failed PyroWave session into MediaCodec with an
+            // incompatible bitstream. Retry creation for a bounded period,
+            // then stop the connection so the next connection can negotiate a
+            // legacy format instead of displaying a permanent black frame.
+            if (recreatePyrowaveDecoder()) {
+                return MoonBridge.DR_NEED_IDR
+            }
+            return recoverPyrowaveDecoder("decoder handle unavailable")
         }
 
         if (needsIdrOnResume) {
@@ -2352,17 +2802,13 @@ class MediaCodecDecoderRenderer(
             if (decodeUnitType == MoonBridge.BUFFER_TYPE_SPS && (videoFormat and MoonBridge.VIDEO_FORMAT_MASK_H264) != 0) {
                 numSpsIn++
 
-                val result = spsPatcher!!.patchSps(
+                val patchedNalu = spsPatcher!!.patchSps(
                     decodeUnitData, decodeUnitLength,
                     refFrameInvalidationActive, initialWidth, initialHeight,
-                    refreshRate, needsBaselineSpsHack
+                    refreshRate
                 )
 
-                if (result.savedSps != null) {
-                    savedSps = result.savedSps
-                }
-
-                spsBuffers.add(result.patchedNalu)
+                spsBuffers.add(patchedNalu)
                 return MoonBridge.DR_OK
             } else if (decodeUnitType == MoonBridge.BUFFER_TYPE_VPS) {
                 numVpsIn++
@@ -2398,6 +2844,10 @@ class MediaCodecDecoderRenderer(
                         return MoonBridge.DR_NEED_IDR
                     }
 
+                    if (!ensureInputBufferCapacity(codecConfigSize())) {
+                        return MoonBridge.DR_NEED_IDR
+                    }
+
                     // Submit all CSD when we receive the first non-CSD blob in an IDR frame
                     for (vpsBuffer in vpsBuffers) {
                         nextInputBuffer!!.put(vpsBuffer)
@@ -2420,9 +2870,7 @@ class MediaCodecDecoderRenderer(
                     // Remember that we submitted CSD globally for this MediaCodec instance
                     submittedCsd = true
 
-                    if (needsBaselineSpsHack) {
-                        needsBaselineSpsHack = false
-
+                    if ((videoFormat and MoonBridge.VIDEO_FORMAT_MASK_H264) != 0 && spsPatcher!!.needsBaselineSpsReplay) {
                         if (!replaySps()) {
                             return MoonBridge.DR_NEED_IDR
                         }
@@ -2459,6 +2907,14 @@ class MediaCodecDecoderRenderer(
             return MoonBridge.DR_NEED_IDR
         }
 
+        // Check the whole access unit before writing any CSD or payload into the codec buffer.
+        val fusedCsdSize = if (frameType == MoonBridge.FRAME_TYPE_IDR && fusedIdrFrame && !csdSubmittedForThisFrame) {
+            codecConfigSize()
+        } else 0L
+        if (!ensureInputBufferCapacity(decodeUnitLength.toLong() + fusedCsdSize)) {
+            return MoonBridge.DR_NEED_IDR
+        }
+
         var codecFlags = 0
 
         if (frameType == MoonBridge.FRAME_TYPE_IDR) {
@@ -2488,17 +2944,6 @@ class MediaCodecDecoderRenderer(
 
         numFramesIn++
 
-        if (decodeUnitLength > nextInputBuffer!!.limit() - nextInputBuffer!!.position()) {
-            val exception = IllegalArgumentException(
-                "Decode unit length $decodeUnitLength too large for input buffer ${nextInputBuffer!!.limit()}"
-            )
-            if (!reportedCrash) {
-                reportedCrash = true
-                crashListener.notifyCrash(exception)
-            }
-            throw RendererException(createDiagnostics(), exception)
-        }
-
         // Copy data from our buffer list into the input buffer
         nextInputBuffer!!.put(decodeUnitData, 0, decodeUnitLength)
 
@@ -2514,14 +2959,18 @@ class MediaCodecDecoderRenderer(
             return false
         }
 
-        val replayNalu = spsPatcher!!.buildReplaySps(savedSps!!)
+        val replayNalu = spsPatcher!!.buildReplaySps()
+        if (!ensureInputBufferCapacity(replayNalu.size.toLong())) {
+            return false
+        }
         nextInputBuffer!!.put(replayNalu)
 
-        // No need for the SPS anymore
-        savedSps = null
-
         // Queue the new SPS
-        return queueNextInputBuffer(0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
+        if (!queueNextInputBuffer(0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)) {
+            return false
+        }
+        spsPatcher!!.onReplaySubmitted()
+        return true
     }
 
     override fun getCapabilities(): Int {
@@ -2547,9 +2996,26 @@ class MediaCodecDecoderRenderer(
             capabilities = capabilities or MoonBridge.CAPABILITY_PRESERVE_HEVC_SEI
         }
 
-        // Enable direct submit on supported hardware
+        // Enable direct submit for legacy codecs on supported hardware. The
+        // common-c depacketizer explicitly suppresses this capability after
+        // PyroWave is negotiated because PyroWave submission is blocking.
         if (directSubmit) {
             capabilities = capabilities or MoonBridge.CAPABILITY_DIRECT_SUBMIT
+        }
+
+        // Keep the capability flag in sync with the explicit format gate in
+        // Game. Auto mode must not advertise PyroWave. Static and dynamic HDR
+        // are eligible only when the GPU Surface decoder and color contract
+        // are available; the negotiated dynamic format is checked by common-c
+        // and the decoder session before media starts.
+        val pyrowaveHdr = pyrowaveHdrMode() != 0
+        if (prefs.videoFormat == PreferenceConfiguration.FormatOption.FORCE_PYROWAVE &&
+            framegenSurface == null &&
+            getPreferredColorSpace() == MoonBridge.COLORSPACE_REC_709 &&
+            (!requestedHdr || pyrowaveHdr) &&
+            pyrowavePreflightAvailable
+        ) {
+            capabilities = capabilities or MoonBridge.CAPABILITY_PYROWAVE
         }
 
         return capabilities
@@ -2638,8 +3104,8 @@ class MediaCodecDecoderRenderer(
                 totalFramesExpected * 100f
         }
 
-        return String.format(
-            "[精确同步: %d渲染/%d接收, 跳帧率: %.1f%%]",
+        return context.getString(
+            R.string.stats_precise_sync,
             globalVideoStats.totalFramesRendered,
             globalVideoStats.totalFramesReceived,
             skipRate

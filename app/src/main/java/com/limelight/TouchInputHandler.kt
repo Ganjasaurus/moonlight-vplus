@@ -23,6 +23,7 @@ import com.limelight.binding.input.touchpad.NonRootTouchpadHandler
 import com.limelight.binding.input.touchpad.CompatibilityTouchpadGesture
 import com.limelight.binding.input.touchpad.CompatibilityTouchpadHandler
 import com.limelight.binding.input.touchpad.TouchpadCompatibilityDevices
+import com.limelight.binding.input.touchpad.TouchpadPointerSpeed
 import com.limelight.binding.input.touchpad.TouchpadSensitivity
 import com.limelight.binding.input.KeyboardTranslator
 import com.limelight.binding.input.touchpad.ScreenDs5PressureClickDetector
@@ -106,7 +107,11 @@ class TouchInputHandler(private val game: Game) {
     private var detectScrolling = false
     var detectMouseMiddle = false         // 键盘处理也会读写
     var detectMouseMiddleDown = false     // 键盘处理也会读写
-    private val nonRootTouchpadHandler = NonRootTouchpadHandler()
+    private var relativeTouchpadRemainderX = 0f
+    private var relativeTouchpadRemainderY = 0f
+    private val nonRootTouchpadHandler = NonRootTouchpadHandler {
+        game.prefConfig.hardwareTouchpadPointerSpeedPercent
+    }
     private val compatibilityTouchpad = CompatibilityTouchpadHandler(game, ::sendCompatibilityTouchpadAction)
     private var compatibilityPointerDeviceId = -1
     private var dispatchedPointerPosition: CompatibilityTouchpadGesture.Action.Position? = null
@@ -354,12 +359,20 @@ if (!compatibilityCancelled && eventSource == 12290) {
 
                 val eventHasRelativeMouseAxes = game.inputCaptureProvider.eventHasRelativeMouseAxes(event)
                 if (!compatibilityCancelled && eventHasRelativeMouseAxes) {
-                    val rawX = game.inputCaptureProvider.getRelativeAxisX(event)
-                    val rawY = game.inputCaptureProvider.getRelativeAxisY(event)
-                    val scaled = if (TouchpadCompatibilityDevices.contains(game, event.device))
-                        touchpadSensitivity.move(rawX, rawY) else null
-                    val deltaX = scaled?.x ?: rawX.toInt().toShort()
-                    val deltaY = scaled?.y ?: rawY.toInt().toShort()
+                    val rawDeltaX = game.inputCaptureProvider.getRelativeAxisX(event)
+                    val rawDeltaY = game.inputCaptureProvider.getRelativeAxisY(event)
+                    val (correctedDeltaX, correctedDeltaY) = game.prefConfig.mouseAxisCorrection.apply(
+                        rawDeltaX,
+                        rawDeltaY
+                    )
+                    // Compatibility touchpads (DeX and others without pointer capture) use their own speed setting
+                    val compatibilityMove = if (TouchpadCompatibilityDevices.contains(game, event.device))
+                        touchpadSensitivity.move(correctedDeltaX, correctedDeltaY) else null
+                    val (deltaX, deltaY) = if (compatibilityMove != null) {
+                        compatibilityMove.x to compatibilityMove.y
+                    } else {
+                        scaleRelativeTouchpadDelta(event, correctedDeltaX, correctedDeltaY)
+                    }
                     if (deltaX.toInt() != 0 || deltaY.toInt() != 0) {
                         if (game.prefConfig.absoluteMouseMode) {
                             val activeStreamView = game.activeStreamView!!
@@ -1438,6 +1451,30 @@ if (!compatibilityCancelled && eventSource == 12290) {
         }
     }
 
+    private fun scaleRelativeTouchpadDelta(event: MotionEvent, deltaX: Float, deltaY: Float): Pair<Short, Short> {
+        if ((event.source and InputDevice.SOURCE_TOUCHPAD) != InputDevice.SOURCE_TOUCHPAD) {
+            relativeTouchpadRemainderX = 0f
+            relativeTouchpadRemainderY = 0f
+            return deltaX.toInt().toShort() to deltaY.toInt().toShort()
+        }
+
+        val speedPercent = game.prefConfig.hardwareTouchpadPointerSpeedPercent
+        val (scaledX, remainderX) = TouchpadPointerSpeed.scaleRelativeDelta(
+            deltaX,
+            relativeTouchpadRemainderX,
+            speedPercent
+        )
+        val (scaledY, remainderY) = TouchpadPointerSpeed.scaleRelativeDelta(
+            deltaY,
+            relativeTouchpadRemainderY,
+            speedPercent
+        )
+        relativeTouchpadRemainderX = remainderX
+        relativeTouchpadRemainderY = remainderY
+        return scaledX.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort() to
+            scaledY.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+    }
+
     fun cancelNonRootTouchpad() {
         nonRootTouchpadHandler.cancelAll(game.conn)
     }
@@ -1621,6 +1658,7 @@ if (!compatibilityCancelled && eventSource == 12290) {
             relativeTouchContextMap[i] = RelativeTouchContext(conn, i, streamView, prefConfig)
         }
         touchContextMap = if (!prefConfig.touchscreenTrackpad) absoluteTouchContextMap else relativeTouchContextMap
+        game.touchpadInputSettings.apply()
     }
 
     companion object {

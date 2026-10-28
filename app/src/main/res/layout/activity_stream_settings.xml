@@ -89,6 +89,7 @@
                 android:paddingEnd="6dp">
 
                 <ImageView
+                    android:id="@+id/settings_search_icon"
                     android:layout_width="20dp"
                     android:layout_height="20dp"
                     app:srcCompat="@drawable/ic_search_stylish"
@@ -192,15 +193,5 @@
         </LinearLayout>
 
     </androidx.drawerlayout.widget.DrawerLayout>
-
-    <FrameLayout
-        android:id="@+id/screen_combination_mode_overlay"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:background="@color/screen_combination_mode_picker_background"
-        android:clickable="true"
-        android:elevation="24dp"
-        android:focusable="true"
-        android:visibility="gone" />
 
 </FrameLayout>
